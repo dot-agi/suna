@@ -26,6 +26,7 @@ from langfuse.client import StatefulGenerationClient, StatefulTraceClient
 from services.langfuse import langfuse
 import datetime
 from litellm.utils import token_counter
+from services.agentops import agentops_service
 
 # Type alias for tool choice
 ToolChoice = Literal["auto", "required", "none"]
@@ -190,6 +191,7 @@ class ThreadManager:
             logger.error(f"Failed to get messages for thread {thread_id}: {str(e)}", exc_info=True)
             return []
 
+    @agentops_service.thread_span()
     async def run_thread(
         self,
         thread_id: str,

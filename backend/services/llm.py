@@ -19,6 +19,7 @@ import litellm
 from litellm.files.main import ModelResponse
 from utils.logger import logger
 from utils.config import config
+from services.agentops import agentops_service
 
 # litellm.set_verbose=True
 litellm.modify_params=True
@@ -258,6 +259,7 @@ def prepare_params(
 
     return params
 
+@agentops_service.llm_span("llm_api_call")
 async def make_llm_api_call(
     messages: List[Dict[str, Any]],
     model_name: str,
@@ -303,6 +305,25 @@ async def make_llm_api_call(
     # debug <timestamp>.json messages
     logger.info(f"Making LLM API call to model: {model_name} (Thinking: {enable_thinking}, Effort: {reasoning_effort})")
     logger.info(f"📡 API Call: Using model {model_name}")
+
+    # Set LLM attributes using semantic conventions
+    agentops_service.set_llm_attributes(
+        model=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        system_prompt=messages[0].get("content") if messages and messages[0].get("role") == "system" else None
+    )
+    
+    # Record AgentOps LLM event with enhanced metadata
+    agentops_service.record_event("llm_call", {
+        "model_name": model_name,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        "enable_thinking": enable_thinking,
+        "reasoning_effort": reasoning_effort,
+        "tool_count": len(tools) if tools else 0
+    })
     params = prepare_params(
         messages=messages,
         model_name=model_name,

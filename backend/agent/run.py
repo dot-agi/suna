@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 from typing import Optional
+from datetime import datetime
 
 # from agent.tools.message_tool import MessageTool
 from agent.tools.message_tool import MessageTool
@@ -31,9 +32,11 @@ from services.langfuse import langfuse
 from agent.gemini_prompt import get_gemini_system_prompt
 from agent.tools.mcp_tool_wrapper import MCPToolWrapper
 from agentpress.tool import SchemaType
+from services.agentops import agentops_service
 
 load_dotenv()
 
+@agentops_service.thread_span("agent_execution")
 async def run_agent(
     thread_id: str,
     project_id: str,
@@ -54,6 +57,27 @@ async def run_agent(
     logger.info(f"🚀 Starting agent with model: {model_name}")
     if agent_config:
         logger.info(f"Using custom agent: {agent_config.get('name', 'Unknown')}")
+
+    # Set initial agent attributes using semantic conventions (tools will be updated after registration)
+    agentops_service.set_agent_attributes(
+        agent_id=f"suna_{thread_id}",
+        agent_name=agent_config.get('name', 'Suna Agent') if agent_config else 'Suna Agent',
+        agent_role="development_assistant" if not is_agent_builder else "agent_builder",
+        tools=[]  # Will be populated after tool registration
+    )
+    
+    # Record AgentOps events with enhanced metadata
+    agentops_service.record_event("agent_start", 
+        status_message="Starting agent execution",
+        metadata={
+            "thread_id": thread_id,
+            "project_id": project_id,
+            "model_name": model_name,
+            "enable_thinking": enable_thinking,
+            "reasoning_effort": reasoning_effort,
+            "agent_name": agent_config.get('name') if agent_config else None,
+            "is_agent_builder": is_agent_builder
+        })
 
     if not trace:
         trace = langfuse.trace(name="run_agent", session_id=thread_id, metadata={"project_id": project_id})
@@ -223,10 +247,30 @@ async def run_agent(
                     logger.info(f"All registered tools after MCP initialization: {all_tools}")
                     mcp_tools = [tool for tool in all_tools if tool not in ['call_mcp_tool', 'sb_files_tool', 'message_tool', 'expand_msg_tool', 'web_search_tool', 'sb_shell_tool', 'sb_vision_tool', 'sb_browser_tool', 'computer_use_tool', 'data_providers_tool', 'sb_deploy_tool', 'sb_expose_tool', 'update_agent_tool']]
                     logger.info(f"MCP tools registered: {mcp_tools}")
+                    
+                    # Update AgentOps with the complete tools list
+                    agentops_service.set_agent_attributes(
+                        agent_id=f"suna_{thread_id}",
+                        agent_name=agent_config.get('name', 'Suna Agent') if agent_config else 'Suna Agent',
+                        agent_role="development_assistant" if not is_agent_builder else "agent_builder",
+                        tools=all_tools
+                    )
+                    logger.info(f"Updated AgentOps with {len(all_tools)} registered tools")
                 
                 except Exception as e:
                     logger.error(f"Failed to initialize MCP tools: {e}")
                     # Continue without MCP tools if initialization fails
+
+    # Update AgentOps with tools list if no MCP tools were processed
+    if not mcp_wrapper_instance:
+        all_tools = list(thread_manager.tool_registry.tools.keys())
+        agentops_service.set_agent_attributes(
+            agent_id=f"suna_{thread_id}",
+            agent_name=agent_config.get('name', 'Suna Agent') if agent_config else 'Suna Agent',
+            agent_role="development_assistant" if not is_agent_builder else "agent_builder",
+            tools=all_tools
+        )
+        logger.info(f"Updated AgentOps with {len(all_tools)} registered tools (no MCP)")
 
     # Prepare system prompt
     # First, get the default system prompt
@@ -356,6 +400,13 @@ async def run_agent(
             data = json.loads(data)
         if trace:
             trace.update(input=data['content'])
+        
+        # Track user input as span attribute for AgentOps
+        agentops_service.set_span_attributes({
+            "input.content": data.get('content', ''),
+            "input.type": "user_message",
+            "input.timestamp": datetime.now().isoformat() if 'datetime' in globals() else None
+        })
 
     while continue_execution and iteration_count < max_iterations:
         iteration_count += 1
@@ -367,6 +418,7 @@ async def run_agent(
             error_msg = f"Billing limit reached: {message}"
             if trace:
                 trace.event(name="billing_limit_reached", level="ERROR", status_message=(f"{error_msg}"))
+                agentops_service.record_event("billing_limit_reached", level="ERROR", status_message=error_msg)
             # Yield a special message to indicate billing limit reached
             yield {
                 "type": "status",
@@ -382,6 +434,9 @@ async def run_agent(
                 logger.info(f"Last message was from assistant, stopping execution")
                 if trace:
                     trace.event(name="last_message_from_assistant", level="DEFAULT", status_message=(f"Last message was from assistant, stopping execution"))
+                agentops_service.record_event("last_message_from_assistant", 
+                    status_message="Last message was from assistant, stopping execution",
+                    metadata={"iteration": iteration_count, "thread_id": thread_id})
                 continue_execution = False
                 break
 
@@ -423,6 +478,9 @@ async def run_agent(
                         })
                         if trace:
                             trace.event(name="screenshot_url_added_to_temporary_message", level="DEFAULT", status_message=(f"Screenshot URL added to temporary message."))
+                        agentops_service.record_event("screenshot_url_added_to_temporary_message", 
+                            status_message="Screenshot URL added to temporary message.",
+                            metadata={"thread_id": thread_id, "iteration": iteration_count})
                     elif screenshot_base64:
                         # Fallback to base64 if URL not available
                         temp_message_content_list.append({
@@ -433,19 +491,35 @@ async def run_agent(
                         })
                         if trace:
                             trace.event(name="screenshot_base64_added_to_temporary_message", level="WARNING", status_message=(f"Screenshot base64 added to temporary message. Prefer screenshot_url if available."))
+                        agentops_service.record_event("screenshot_base64_added_to_temporary_message", 
+                            level="WARNING", 
+                            status_message="Screenshot base64 added to temporary message. Prefer screenshot_url if available.",
+                            metadata={"thread_id": thread_id, "iteration": iteration_count})
                     else:
                         logger.warning("Browser state found but no screenshot data.")
                         if trace:
                             trace.event(name="browser_state_found_but_no_screenshot_data", level="WARNING", status_message=(f"Browser state found but no screenshot data."))
+                        agentops_service.record_event("browser_state_found_but_no_screenshot_data", 
+                            level="WARNING", 
+                            status_message="Browser state found but no screenshot data.",
+                            metadata={"thread_id": thread_id, "iteration": iteration_count})
                 else:
                     logger.warning("Model is Gemini, Anthropic, or OpenAI, so not adding screenshot to temporary message.")
                     if trace:
                         trace.event(name="model_is_gemini_anthropic_or_openai", level="WARNING", status_message=(f"Model is Gemini, Anthropic, or OpenAI, so not adding screenshot to temporary message."))
+                    agentops_service.record_event("model_is_gemini_anthropic_or_openai", 
+                        level="WARNING", 
+                        status_message="Model is Gemini, Anthropic, or OpenAI, so not adding screenshot to temporary message.",
+                        metadata={"thread_id": thread_id, "model_name": model_name})
 
             except Exception as e:
                 logger.error(f"Error parsing browser state: {e}")
                 if trace:
                     trace.event(name="error_parsing_browser_state", level="ERROR", status_message=(f"{e}"))
+                agentops_service.record_event("error_parsing_browser_state", 
+                    level="ERROR", 
+                    status_message=str(e),
+                    metadata={"thread_id": thread_id, "iteration": iteration_count})
 
         # Get the latest image_context message (NEW)
         latest_image_context_msg = await client.table('messages').select('*').eq('thread_id', thread_id).eq('type', 'image_context').order('created_at', desc=True).limit(1).execute()
@@ -475,6 +549,10 @@ async def run_agent(
                 logger.error(f"Error parsing image context: {e}")
                 if trace:
                     trace.event(name="error_parsing_image_context", level="ERROR", status_message=(f"{e}"))
+                agentops_service.record_event("error_parsing_image_context", 
+                    level="ERROR", 
+                    status_message=str(e),
+                    metadata={"thread_id": thread_id, "iteration": iteration_count})
 
         # If we have any content, construct the temporary_message
         if temp_message_content_list:
@@ -529,6 +607,10 @@ async def run_agent(
                 logger.error(f"Error response from run_thread: {response.get('message', 'Unknown error')}")
                 if trace:
                     trace.event(name="error_response_from_run_thread", level="ERROR", status_message=(f"{response.get('message', 'Unknown error')}"))
+                agentops_service.record_event("error_response_from_run_thread", 
+                    level="ERROR", 
+                    status_message=response.get('message', 'Unknown error'),
+                    metadata={"thread_id": thread_id, "iteration": iteration_count})
                 yield response
                 break
 
@@ -548,6 +630,10 @@ async def run_agent(
                             logger.error(f"Error chunk detected: {chunk.get('message', 'Unknown error')}")
                             if trace:
                                 trace.event(name="error_chunk_detected", level="ERROR", status_message=(f"{chunk.get('message', 'Unknown error')}"))
+                            agentops_service.record_event("error_chunk_detected", 
+                                level="ERROR", 
+                                status_message=chunk.get('message', 'Unknown error'),
+                                metadata={"thread_id": thread_id, "iteration": iteration_count})
                             error_detected = True
                             yield chunk  # Forward the error chunk
                             continue     # Continue processing other chunks but don't break yet
@@ -565,6 +651,9 @@ async def run_agent(
                                     logger.info("Agent termination signal detected in status message")
                                     if trace:
                                         trace.event(name="agent_termination_signal_detected", level="DEFAULT", status_message="Agent termination signal detected in status message")
+                                    agentops_service.record_event("agent_termination_signal_detected", 
+                                        status_message="Agent termination signal detected in status message",
+                                        metadata={"thread_id": thread_id, "iteration": iteration_count})
                                     
                                     # Extract the tool name from the status content if available
                                     content = chunk.get('content', {})
@@ -605,16 +694,27 @@ async def run_agent(
                                        logger.info(f"Agent used XML tool: {xml_tool}")
                                        if trace:
                                            trace.event(name="agent_used_xml_tool", level="DEFAULT", status_message=(f"Agent used XML tool: {xml_tool}"))
+                                       agentops_service.record_event("agent_used_xml_tool", 
+                                           status_message=f"Agent used XML tool: {xml_tool}",
+                                           metadata={"thread_id": thread_id, "iteration": iteration_count, "xml_tool": xml_tool})
                             
                             except json.JSONDecodeError:
                                 # Handle cases where content might not be valid JSON
                                 logger.warning(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}")
                                 if trace:
                                     trace.event(name="warning_could_not_parse_assistant_content_json", level="WARNING", status_message=(f"Warning: Could not parse assistant content JSON: {chunk.get('content')}"))
+                                agentops_service.record_event("warning_could_not_parse_assistant_content_json", 
+                                    level="WARNING", 
+                                    status_message=f"Warning: Could not parse assistant content JSON: {chunk.get('content')}",
+                                    metadata={"thread_id": thread_id, "iteration": iteration_count})
                             except Exception as e:
                                 logger.error(f"Error processing assistant chunk: {e}")
                                 if trace:
                                     trace.event(name="error_processing_assistant_chunk", level="ERROR", status_message=(f"Error processing assistant chunk: {e}"))
+                                agentops_service.record_event("error_processing_assistant_chunk", 
+                                    level="ERROR", 
+                                    status_message=f"Error processing assistant chunk: {e}",
+                                    metadata={"thread_id": thread_id, "iteration": iteration_count})
 
                         yield chunk
                 else:
@@ -627,6 +727,9 @@ async def run_agent(
                     logger.info(f"Stopping due to error detected in response")
                     if trace:
                         trace.event(name="stopping_due_to_error_detected_in_response", level="DEFAULT", status_message=(f"Stopping due to error detected in response"))
+                    agentops_service.record_event("stopping_due_to_error_detected_in_response", 
+                        status_message="Stopping due to error detected in response",
+                        metadata={"thread_id": thread_id, "iteration": iteration_count})
                     if generation:
                         generation.end(output=full_response, status_message="error_detected", level="ERROR")
                     break
@@ -635,6 +738,9 @@ async def run_agent(
                     logger.info(f"Agent decided to stop with tool: {last_tool_call}")
                     if trace:
                         trace.event(name="agent_decided_to_stop_with_tool", level="DEFAULT", status_message=(f"Agent decided to stop with tool: {last_tool_call}"))
+                    agentops_service.record_event("agent_decided_to_stop_with_tool", 
+                        status_message=f"Agent decided to stop with tool: {last_tool_call}",
+                        metadata={"thread_id": thread_id, "iteration": iteration_count, "tool": last_tool_call})
                     if generation:
                         generation.end(output=full_response, status_message="agent_stopped")
                     continue_execution = False
@@ -670,5 +776,14 @@ async def run_agent(
             break
         if generation:
             generation.end(output=full_response)
+            
+        # Track assistant response as span attribute for AgentOps
+        if full_response:
+            agentops_service.set_span_attributes({
+                "output.content": full_response[:1000],  # Truncate very long responses
+                "output.type": "assistant_response",
+                "output.length": len(full_response),
+                "output.iteration": iteration_count
+            })
 
     asyncio.create_task(asyncio.to_thread(lambda: langfuse.flush()))

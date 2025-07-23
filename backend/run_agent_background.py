@@ -19,6 +19,7 @@ from dramatiq.brokers.rabbitmq import RabbitmqBroker
 import os
 from services.langfuse import langfuse
 from utils.retry import retry
+from services.agentops import agentops_service
 
 import sentry_sdk
 from typing import Dict, Any
@@ -41,6 +42,13 @@ async def initialize():
         instance_id = str(uuid.uuid4())[:8]
     await retry(lambda: redis.initialize_async())
     await db.initialize()
+    
+    # Initialize AgentOps service in worker process (with error handling)
+    try:
+        agentops_service.init()
+        logger.info("AgentOps service initialized in worker process")
+    except Exception as e:
+        logger.warning(f"AgentOps initialization failed in worker, continuing without tracing: {e}")
 
     _initialized = True
     logger.info(f"Initialized agent API with instance ID: {instance_id}")
@@ -52,6 +60,7 @@ async def check_health(key: str):
     await redis.set(key, "healthy", ex=redis.REDIS_KEY_TTL)
 
 @dramatiq.actor
+@agentops_service.agent_span()
 async def run_agent_background(
     agent_run_id: str,
     thread_id: str,
@@ -66,6 +75,7 @@ async def run_agent_background(
     is_agent_builder: Optional[bool] = False,
     target_agent_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    agentops_context: Optional[dict] = None,
 ):
     """Run the agent in the background using Redis for state."""
     structlog.contextvars.clear_contextvars()
@@ -74,6 +84,26 @@ async def run_agent_background(
         thread_id=thread_id,
         request_id=request_id,
     )
+
+    # Deserialize and set AgentOps context if provided
+    if agentops_context:
+        try:
+            trace_context = agentops_service.deserialize_context(agentops_context)
+            if trace_context:
+                agentops_service.set_context(trace_context)
+                logger.debug(f"Restored AgentOps context in background worker for {agent_run_id}")
+            else:
+                logger.warning(f"Failed to deserialize AgentOps context for {agent_run_id}")
+        except Exception as e:
+            logger.error(f"Error deserializing AgentOps context for {agent_run_id}: {e}")
+
+    # Record AgentOps background agent start event
+    agentops_service.record_event("background_agent_start", {
+        "agent_run_id": agent_run_id,
+        "thread_id": thread_id,
+        "project_id": project_id,
+        "model_name": model_name
+    })
 
     try:
         await initialize()
@@ -304,6 +334,21 @@ async def run_agent_background(
             await asyncio.wait_for(asyncio.gather(*pending_redis_operations), timeout=30.0)
         except asyncio.TimeoutError:
             logger.warning(f"Timeout waiting for pending Redis operations for {agent_run_id}")
+
+        # Record AgentOps background agent completion
+        agentops_service.record_event("background_agent_end", {
+            "agent_run_id": agent_run_id,
+            "final_status": final_status,
+            "duration_seconds": (datetime.now(timezone.utc) - start_time).total_seconds()
+        })
+
+        # End AgentOps session trace based on final status
+        if final_status == "completed":
+            agentops_service.end_session_trace(end_state="Success")
+        elif final_status == "failed":
+            agentops_service.end_session_trace(end_state="Error")
+        else:
+            agentops_service.end_session_trace(end_state="Indeterminate")
 
         logger.info(f"Agent run background task fully completed for: {agent_run_id} (Instance: {instance_id}) with final status: {final_status}")
 

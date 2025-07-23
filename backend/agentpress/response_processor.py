@@ -26,6 +26,7 @@ from agentpress.utils.json_helpers import (
     to_json_string, format_for_yield
 )
 from litellm.utils import token_counter
+from services.agentops import agentops_service
 
 # Type alias for XML result adding strategy
 XmlAddingStrategy = Literal["user_message", "assistant_message", "inline_edit"]
@@ -1347,6 +1348,7 @@ class ResponseProcessor:
         return parsed_data
 
     # Tool execution methods
+    @agentops_service.tool_span()
     async def _execute_tool(self, tool_call: Dict[str, Any]) -> ToolResult:
         """Execute a single tool call and return the result."""
         span = self.trace.span(name=f"execute_tool.{tool_call['function_name']}", input=tool_call["arguments"])            
@@ -1356,6 +1358,13 @@ class ResponseProcessor:
 
             logger.info(f"Executing tool: {function_name} with arguments: {arguments}")
             self.trace.event(name="executing_tool", level="DEFAULT", status_message=(f"Executing tool: {function_name} with arguments: {arguments}"))
+            
+            # Record AgentOps tool execution start event
+            agentops_service.record_event("tool_execution_start", {
+                "tool_name": function_name,
+                "arguments": str(arguments)[:500],  # Truncate large arguments
+                "tool_id": tool_call.get("id", function_name)
+            })
             
             if isinstance(arguments, str):
                 try:
@@ -1376,6 +1385,15 @@ class ResponseProcessor:
             logger.debug(f"Found tool function for '{function_name}', executing...")
             result = await tool_fn(**arguments)
             logger.info(f"Tool execution complete: {function_name} -> {result}")
+            
+            # Record AgentOps tool execution completion event
+            agentops_service.record_event("tool_execution_complete", {
+                "tool_name": function_name,
+                "success": getattr(result, 'success', True),
+                "output": str(getattr(result, 'output', result))[:500],  # Truncate large outputs
+                "tool_id": tool_call.get("id", function_name)
+            })
+            
             span.end(status_message="tool_executed", output=result)
             return result
         except Exception as e:

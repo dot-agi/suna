@@ -453,6 +453,20 @@ async def start_agent(
 
     request_id = structlog.contextvars.get_contextvars().get('request_id')
 
+    # Start AgentOps session trace and set context
+    from services.agentops import agentops_service
+    agentops_context = agentops_service.start_session_trace(
+        thread_id=thread_id,
+        project_id=project_id,
+        user_id=user_id,
+        tags=["agent_run", "start_agent"]
+    )
+    # Set context for the background worker to access
+    agentops_service.set_context(agentops_context)
+    
+    # Serialize context for background worker
+    serialized_agentops_context = agentops_service.serialize_context(agentops_context)
+
     # Run the agent in the background
     run_agent_background.send(
         agent_run_id=agent_run_id, thread_id=thread_id, instance_id=instance_id,
@@ -464,6 +478,7 @@ async def start_agent(
         is_agent_builder=is_agent_builder,
         target_agent_id=target_agent_id,
         request_id=request_id,
+        agentops_context=serialized_agentops_context,  # Pass serialized context
     )
 
     return {"agent_run_id": agent_run_id, "status": "running"}
@@ -1200,6 +1215,22 @@ async def initiate_agent_with_files(
 
         request_id = structlog.contextvars.get_contextvars().get('request_id')
 
+        request_id = structlog.contextvars.get_contextvars().get('request_id')
+
+        # Start AgentOps session trace and set context
+        from services.agentops import agentops_service
+        agentops_context = agentops_service.start_session_trace(
+            thread_id=thread_id,
+            project_id=project_id,
+            user_id=user_id,
+            tags=["agent_run", "initiate_agent"]
+        )
+        # Set context for the background worker to access
+        agentops_service.set_context(agentops_context)
+        
+        # Serialize context for background worker
+        serialized_agentops_context = agentops_service.serialize_context(agentops_context)
+
         # Run agent in background
         run_agent_background.send(
             agent_run_id=agent_run_id, thread_id=thread_id, instance_id=instance_id,
@@ -1211,6 +1242,7 @@ async def initiate_agent_with_files(
             is_agent_builder=is_agent_builder,
             target_agent_id=target_agent_id,
             request_id=request_id,
+            agentops_context=serialized_agentops_context,  # Pass serialized context
         )
 
         return {"thread_id": thread_id, "agent_run_id": agent_run_id}
@@ -2465,4 +2497,3 @@ async def get_agent_tools(
         for tool_name in enabled_tools:
             mcp_tools.append({"name": tool_name, "server": server, "enabled": True})
     return {"agentpress_tools": agentpress_tools, "mcp_tools": mcp_tools}
-

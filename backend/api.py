@@ -49,6 +49,10 @@ async def lifespan(app: FastAPI):
     try:
         await db.initialize()
         
+        # Initialize AgentOps service
+        from services.agentops import agentops_service
+        agentops_service.init()
+        
         agent_api.initialize(
             db,
             instance_id
