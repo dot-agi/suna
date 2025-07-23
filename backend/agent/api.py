@@ -14,7 +14,7 @@ import os
 from agentpress.thread_manager import ThreadManager
 from services.supabase import DBConnection
 from services import redis
-from utils.auth_utils import get_current_user_id_from_jwt, get_user_id_from_stream_auth, verify_thread_access
+from utils.auth_utils import get_current_user_id_from_jwt, get_user_id_from_stream_auth, verify_thread_access, verify_admin_api_key
 from utils.logger import logger, structlog
 from services.billing import check_billing_status, can_use_model
 from utils.config import config
@@ -28,6 +28,7 @@ from .config_helper import extract_agent_config, build_unified_config, extract_t
 from .versioning.facade import version_manager
 from .versioning.api.routes import router as version_router
 from .versioning.infrastructure.dependencies import set_db_connection
+from agent.services.suna_default_agent_service import SunaDefaultAgentService
 
 router = APIRouter()
 router.include_router(version_router)
@@ -117,6 +118,7 @@ class AgentResponse(BaseModel):
     current_version_id: Optional[str] = None
     version_count: Optional[int] = 1
     current_version: Optional[AgentVersionResponse] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 class PaginationInfo(BaseModel):
     page: int
@@ -662,7 +664,8 @@ async def get_thread_agent(thread_id: str, user_id: str = Depends(get_current_us
                 updated_at=agent_data['updated_at'],
                 current_version_id=agent_data.get('current_version_id'),
                 version_count=agent_data.get('version_count', 1),
-                current_version=current_version
+                current_version=current_version,
+                metadata=agent_data.get('metadata')
             ),
             "source": agent_source,
             "message": f"Using {agent_source} agent: {agent_data['name']}. Threads are agent-agnostic - you can change agents anytime."
@@ -1484,7 +1487,8 @@ async def get_agents(
                 updated_at=agent['updated_at'],
                 current_version_id=agent.get('current_version_id'),
                 version_count=agent.get('version_count', 1),
-                current_version=current_version
+                current_version=current_version,
+                metadata=agent.get('metadata')
             ))
         
         total_pages = (total_count + limit - 1) // limit
@@ -1555,14 +1559,12 @@ async def get_agent(agent_id: str, user_id: str = Depends(get_current_user_id_fr
             except Exception as e:
                 logger.warning(f"Failed to get version data for agent {agent_id}: {e}")
         
-        # Use version data for configuration if available
         if current_version:
             system_prompt = current_version.system_prompt
             configured_mcps = current_version.configured_mcps
             custom_mcps = current_version.custom_mcps
             agentpress_tools = current_version.agentpress_tools
         else:
-            # Fallback to agent data if no version
             system_prompt = agent_data['system_prompt']
             configured_mcps = agent_data.get('configured_mcps', [])
             custom_mcps = agent_data.get('custom_mcps', [])
@@ -1588,7 +1590,8 @@ async def get_agent(agent_id: str, user_id: str = Depends(get_current_user_id_fr
             updated_at=agent_data.get('updated_at', agent_data['created_at']),
             current_version_id=agent_data.get('current_version_id'),
             version_count=agent_data.get('version_count', 1),
-            current_version=current_version
+            current_version=current_version,
+            metadata=agent_data.get('metadata')
         )
         
     except HTTPException:
@@ -1710,7 +1713,8 @@ async def create_agent(
             updated_at=agent.get('updated_at', agent['created_at']),
             current_version_id=agent.get('current_version_id'),
             version_count=agent.get('version_count', 1),
-            current_version=current_version
+            current_version=current_version,
+            metadata=agent.get('metadata')
         )
         
     except HTTPException:
@@ -1762,6 +1766,57 @@ async def update_agent(
             raise HTTPException(status_code=404, detail="Agent not found")
         
         existing_data = existing_agent.data
+
+        agent_metadata = existing_data.get('metadata', {})
+        is_suna_agent = agent_metadata.get('is_suna_default', False)
+        restrictions = agent_metadata.get('restrictions', {})
+        
+        if is_suna_agent:
+            logger.warning(f"Update attempt on Suna default agent {agent_id} by user {user_id}")
+            
+            if (agent_data.name is not None and 
+                agent_data.name != existing_data.get('name') and 
+                restrictions.get('name_editable') == False):
+                logger.error(f"User {user_id} attempted to modify restricted name of Suna agent {agent_id}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Suna's name cannot be modified. This restriction is managed centrally."
+                )
+            
+            if (agent_data.description is not None and
+                agent_data.description != existing_data.get('description') and 
+                restrictions.get('description_editable') == False):
+                logger.error(f"User {user_id} attempted to modify restricted description of Suna agent {agent_id}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Suna's description cannot be modified."
+                )
+            
+            if (agent_data.system_prompt is not None and 
+                restrictions.get('system_prompt_editable') == False):
+                logger.error(f"User {user_id} attempted to modify restricted system prompt of Suna agent {agent_id}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Suna's system prompt cannot be modified. This is managed centrally to ensure optimal performance."
+                )
+            
+            if (agent_data.agentpress_tools is not None and 
+                restrictions.get('tools_editable') == False):
+                logger.error(f"User {user_id} attempted to modify restricted tools of Suna agent {agent_id}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Suna's default tools cannot be modified. These tools are optimized for Suna's capabilities."
+                )
+            
+            if ((agent_data.configured_mcps is not None or agent_data.custom_mcps is not None) and 
+                restrictions.get('mcps_editable') == False):
+                logger.error(f"User {user_id} attempted to modify restricted MCPs of Suna agent {agent_id}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Suna's integrations cannot be modified."
+                )
+            
+            logger.info(f"Suna agent update validation passed for agent {agent_id} by user {user_id}")
 
         current_version_data = None
         if existing_data.get('current_version_id'):
@@ -2058,7 +2113,8 @@ async def update_agent(
             updated_at=agent.get('updated_at', agent['created_at']),
             current_version_id=agent.get('current_version_id'),
             version_count=agent.get('version_count', 1),
-            current_version=current_version
+            current_version=current_version,
+            metadata=agent.get('metadata')
         )
         
     except HTTPException:
