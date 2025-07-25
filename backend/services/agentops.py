@@ -119,15 +119,10 @@ class AgentOpsService:
             
         try:
             # Prepare tags for the session
-            session_tags = {
-                "thread_id": thread_id,
-                "project_id": project_id,
-                "user_id": user_id,
-                "platform": "suna"
-            }
-            
+            session_tags = [thread_id, project_id, user_id]
+
             if tags:
-                session_tags["custom_tags"] = tags
+                session_tags.extend(tags)
                 
             # Start trace using AgentOps
             trace_context = agentops.start_trace(
