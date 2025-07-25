@@ -7,6 +7,8 @@ that coexists with the existing Langfuse tracing without conflicts.
 
 import os
 import threading
+import asyncio
+import inspect
 from functools import wraps
 from typing import Optional, Dict, Any, List, Union
 from utils.logger import logger
@@ -377,28 +379,64 @@ class AgentOpsService:
     def thread_span(self, name: Optional[str] = None):
         """Decorator for thread-level spans."""
         def decorator(func):
-            @wraps(func)
-            async def wrapper(*args, **kwargs):
-                # Check if enabled at runtime, not import time
-                if not self.enabled or not AGENTOPS_AVAILABLE:
-                    return await func(*args, **kwargs)
-                
-                try:
-                    # Set span attributes with task span kind (threads represent task execution)
-                    self.set_span_attributes({
-                        "agentops.span.kind": SpanKind.TASK if SpanKind else "task",
-                        "task.function": func.__name__
-                    })
-                    
-                    # Record thread start
-                    self.record_event("thread_start", {"function": func.__name__})
-                    result = await func(*args, **kwargs)
-                    return result
-                except Exception as e:
-                    # Record error in trace metadata
-                    self.record_event("thread_error", {"error_type": type(e).__name__, "error_message": str(e)})
-                    raise
-            return wrapper
+            # Check if the function is an async generator
+            if inspect.iscoroutinefunction(func) and inspect.isasyncgenfunction(func):
+                # Create async generator wrapper
+                @wraps(func)
+                async def async_gen_wrapper(*args, **kwargs):
+                    # Check if enabled at runtime, not import time
+                    if not self.enabled or not AGENTOPS_AVAILABLE:
+                        async for item in func(*args, **kwargs):
+                            yield item
+                        return
+
+                    try:
+                        # Set span attributes with task span kind (threads represent task execution)
+                        self.set_span_attributes({
+                            "agentops.span.kind": SpanKind.TASK if SpanKind else "task",
+                            "task.function": func.__name__
+                        })
+                        
+                        # Record thread start
+                        self.record_event("thread_start", {"function": func.__name__})
+
+                        # Handle async generators correctly
+                        result_generator = func(*args, **kwargs)
+                        async for item in result_generator:
+                            yield item
+
+                    except Exception as e:
+                        # Record error in trace metadata
+                        self.record_event("thread_error", {"error_type": type(e).__name__, "error_message": str(e)})
+                        raise
+                return async_gen_wrapper
+            else:
+                # Create regular async function wrapper
+                @wraps(func)
+                async def async_func_wrapper(*args, **kwargs):
+                    # Check if enabled at runtime, not import time
+                    if not self.enabled or not AGENTOPS_AVAILABLE:
+                        return await func(*args, **kwargs)
+
+                    try:
+                        # Set span attributes with task span kind (threads represent task execution)
+                        self.set_span_attributes({
+                            "agentops.span.kind": SpanKind.TASK if SpanKind else "task",
+                            "task.function": func.__name__
+                        })
+                        
+                        # Record thread start
+                        self.record_event("thread_start", {"function": func.__name__})
+
+                        # For regular async functions
+                        result = await func(*args, **kwargs)
+                        return result
+
+                    except Exception as e:
+                        # Record error in trace metadata
+                        self.record_event("thread_error", {"error_type": type(e).__name__, "error_message": str(e)})
+                        raise
+                return async_func_wrapper
         return decorator
 
     def llm_span(self, name: Optional[str] = None):
