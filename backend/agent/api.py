@@ -1223,7 +1223,7 @@ async def initiate_agent_with_files(
         # Start AgentOps session trace and set context
         from services.agentops import agentops_service
         agentops_context = agentops_service.start_session_trace(
-            thread_id=thread_id,
+            thread_id=thread_data["thread_id"],
             project_id=project_id,
             user_id=user_id,
             tags=["agent_run", "initiate_agent"]
